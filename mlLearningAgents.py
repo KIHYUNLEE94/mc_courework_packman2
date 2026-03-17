@@ -46,9 +46,29 @@ class GameStateFeatures:
         Args:
             state: A given game state object
         """
+        # Store the underlying game state so that we can
+        # use it as a compact, hashable representation.
+        #
+        # GameState already implements __eq__ and __hash__
+        # based on the essential game data, so we simply
+        # wrap it here.
+        self.state = state
 
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+    def __hash__(self):
+        """
+        Make GameStateFeatures usable as a dictionary key by
+        delegating to the underlying GameState hash.
+        """
+        return hash(self.state)
+
+    def __eq__(self, other):
+        """
+        Two feature objects are equal if the underlying game
+        states are equal.
+        """
+        if not isinstance(other, GameStateFeatures):
+            return False
+        return self.state == other.state
 
 
 class QLearnAgent(Agent):
@@ -74,13 +94,21 @@ class QLearnAgent(Agent):
             numTraining: number of training episodes
         """
         super().__init__()
+        # Core learning hyperparameters
         self.alpha = float(alpha)
         self.epsilon = float(epsilon)
         self.gamma = float(gamma)
         self.maxAttempts = int(maxAttempts)
         self.numTraining = int(numTraining)
-        # Count the number of games we have played
+        # Count the number of games that have finished so far
         self.episodesSoFar = 0
+        # Q-value table: maps (GameStateFeatures, action) -> Q-value
+        self.qValues = util.Counter()
+        # Visitation counts for (state, action) pairs
+        self.counts = util.Counter()
+        # Track last transition for online learning
+        self.lastState = None
+        self.lastAction = None
 
     # Accessor functions for the variable episodesSoFar controlling learning
     def incrementEpisodesSoFar(self):
@@ -121,8 +149,10 @@ class QLearnAgent(Agent):
         Returns:
             The reward assigned for the given trajectory
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        # Reward is defined as the change in game score between
+        # two consecutive states. The internal scoring already
+        # encodes step penalties, food/ghost rewards and win/lose.
+        return endState.getScore() - startState.getScore()
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -137,8 +167,7 @@ class QLearnAgent(Agent):
         Returns:
             Q(state, action)
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        return self.qValues[(state, action)]
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -150,8 +179,16 @@ class QLearnAgent(Agent):
         Returns:
             q_value: the maximum estimated Q-value attainable from the state
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        # If there are no legal actions (terminal state), the
+        # maximal future Q-value is defined to be 0.
+        legal = state.state.getLegalPacmanActions()
+        if Directions.STOP in legal:
+            legal.remove(Directions.STOP)
+        if not legal:
+            return 0.0
+
+        values = [self.getQValue(state, action) for action in legal]
+        return max(values)
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -169,8 +206,15 @@ class QLearnAgent(Agent):
             nextState: the resulting state
             reward: the reward received on this trajectory
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        # Standard Q-learning update:
+        #
+        #   Q(s, a) ← Q(s, a) + α * (r + γ * max_a' Q(s', a') − Q(s, a))
+        #
+        currentQ = self.getQValue(state, action)
+        futureQ = self.maxQValue(nextState)
+        target = reward + self.getGamma() * futureQ
+        updated = currentQ + self.getAlpha() * (target - currentQ)
+        self.qValues[(state, action)] = updated
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -184,8 +228,7 @@ class QLearnAgent(Agent):
             state: Starting state
             action: Action taken
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        self.counts[(state, action)] += 1
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -200,8 +243,7 @@ class QLearnAgent(Agent):
         Returns:
             Number of times that the action has been taken in a given state
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        return self.counts[(state, action)]
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -221,8 +263,14 @@ class QLearnAgent(Agent):
         Returns:
             The exploration value
         """
-        "*** YOUR CODE HERE ***"
-        util.raiseNotDefined()
+        # Simple optimistic exploration: for actions that have been
+        # tried fewer than maxAttempts times in a given state, boost
+        # their apparent utility so they are preferred during
+        # exploitation. Once sufficiently tried, fall back to the
+        # given utility.
+        if counts < self.getMaxAttempts():
+            return utility + 1.0
+        return utility
 
     # WARNING: You will be tested on the functionality of this method
     # DO NOT change the function signature
@@ -255,9 +303,37 @@ class QLearnAgent(Agent):
 
         stateFeatures = GameStateFeatures(state)
 
-        # Now pick what action to take.
-        # The current code shows how to do that but just makes the choice randomly.
-        return random.choice(legal)
+        # Perform an online Q-learning update using the transition
+        # from the previous state (if any) to the current one.
+        if self.lastState is not None and self.lastAction is not None:
+            prevFeatures = GameStateFeatures(self.lastState)
+            reward = self.computeReward(self.lastState, state)
+            self.learn(prevFeatures, self.lastAction, reward, stateFeatures)
+
+        # Epsilon-greedy exploration/exploitation:
+        #  - with probability epsilon, take a random legal action;
+        #  - otherwise, pick the action with the highest exploration-
+        #    adjusted Q-value using explorationFn.
+        if util.flipCoin(self.epsilon):
+            chosenAction = random.choice(legal)
+        else:
+            scored_actions = []
+            for action in legal:
+                q = self.getQValue(stateFeatures, action)
+                c = self.getCount(stateFeatures, action)
+                score = self.explorationFn(q, c)
+                scored_actions.append((score, action))
+            maxScore = max(scored_actions, key=lambda sa: sa[0])[0]
+            bestActions = [a for (s, a) in scored_actions if s == maxScore]
+            chosenAction = random.choice(bestActions)
+
+        # Update visitation counts and remember this state/action
+        # for use in the next Q-learning update.
+        self.updateCount(stateFeatures, chosenAction)
+        self.lastState = state
+        self.lastAction = chosenAction
+
+        return chosenAction
 
     def final(self, state: GameState):
         """
@@ -268,6 +344,18 @@ class QLearnAgent(Agent):
             state: the final game state
         """
         print(f"Game {self.getEpisodesSoFar()} just ended!")
+
+        # Perform one final Q-learning update for the transition into
+        # this terminal state so that the win/lose rewards are taken
+        # into account. final() is the only place those rewards are
+        # accessible for the last move.
+        if self.lastState is not None and self.lastAction is not None:
+            terminalFeatures = GameStateFeatures(state)
+            prevFeatures = GameStateFeatures(self.lastState)
+            reward = self.computeReward(self.lastState, state)
+            self.learn(prevFeatures, self.lastAction, reward, terminalFeatures)
+            self.lastState = None
+            self.lastAction = None
 
         # Keep track of the number of games played, and set learning
         # parameters to zero when we are done with the pre-set number
